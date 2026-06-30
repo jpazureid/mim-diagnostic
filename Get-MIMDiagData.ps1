@@ -3,8 +3,8 @@
     MIM / FIM diagnostic data collector.
 
 .VERSION
-    Version：Get-MIMDiagData_v1_18.ps1
-    Updated: v1.18 expands Connector Space and Metaverse Lithnet Attributes dictionaries into real attribute-value CSV/HTML sections in OBJ mode. v1.17 creates MIM_Diagnostic_Report.html in OBJ mode with AD DS / Connector Space / Metaverse attribute-value sections. v1.16 changes OBJ mode credential input to Get-Credential, removes command-line password usage, and prevents duplicate ConnectorSpace / Metaverse folders under OBJECT_SUMMARY. v1.14 stores all collection output under the -Logpath output root, uses MIMLOG_<timestamp> as the root folder name, and avoids creating temporary working folders under Windows Temp. v1.13 fixes Metaverse extension DataTable handling and Windows PowerShell Out-File compatibility. v1.12 fixes Metaverse rules extension collection when running from the FIMService server by avoiding SQL double-hop authentication. v1.11 added Metaverse rules extension configuration/DLL collection and includes it in the HTML report. Previous updates: v1.10 removes MA XML parse-check output and fixes UTF-8 reading for MA XML Japanese OU names; quiet mode by default, service/portal build collection, SharePoint version collection, name resolution/DC inventory, robust MA XML summary parsing, optional PCNS collection, improved best-effort metaverse object extraction for OBJ mode, skips CONFIG/EVENTLOG folders in OBJ mode, and creates an HTML summary report.
+    Version：Get-MIMDiagData_v1_19.ps1
+    Updated: v1.19 changes event log collection to EVTX-only output, supports both co-located and separated FIMService / FIMSynchronizationService topologies, exports only logs that exist on each target server, adds Forefront Identity Manager and Forefront Identity Manager Management Agent event log collection, and removes the uncompressed output root after ZIP creation. v1.18 expands Connector Space and Metaverse Lithnet Attributes dictionaries into real attribute-value CSV/HTML sections in OBJ mode. v1.17 creates MIM_Diagnostic_Report.html in OBJ mode with AD DS / Connector Space / Metaverse attribute-value sections. v1.16 changes OBJ mode credential input to Get-Credential, removes command-line password usage, and prevents duplicate ConnectorSpace / Metaverse folders under OBJECT_SUMMARY. v1.14 stores all collection output under the -Logpath output root, uses MIMLOG_<timestamp> as the root folder name, and avoids creating temporary working folders under Windows Temp. v1.13 fixes Metaverse extension DataTable handling and Windows PowerShell Out-File compatibility. v1.12 fixes Metaverse rules extension collection when running from the FIMService server by avoiding SQL double-hop authentication. v1.11 added Metaverse rules extension configuration/DLL collection and includes it in the HTML report. Previous updates: v1.10 removes MA XML parse-check output and fixes UTF-8 reading for MA XML Japanese OU names; quiet mode by default, service/portal build collection, SharePoint version collection, name resolution/DC inventory, robust MA XML summary parsing, optional PCNS collection, improved best-effort metaverse object extraction for OBJ mode, skips CONFIG folder in OBJ mode, and creates an HTML summary report.
 
 .USAGE
     Note: MIM ポータルを利用していない環境の場合は、-MimServiceUri は不要です。
@@ -73,13 +73,13 @@ $ConfigDir   = Join-Path $Root "CONFIG"
 $EventLogDir = Join-Path $Root "EVENTLOG"
 $DiagDir     = Join-Path $Root "DIAGNOSTIC"
 
-# OBJ mode collects only object-focused diagnostics.
-# Do not create CONFIG / EVENTLOG folders in OBJ mode because they are not used.
+# OBJ mode collects object-focused diagnostics and event logs.
+# CONFIG is not created in OBJ mode because MIM Service configuration collection is not used there.
 $null = New-Item -Path $SyncDataDir -ItemType Directory -Force
 $null = New-Item -Path $DiagDir     -ItemType Directory -Force
+$null = New-Item -Path $EventLogDir -ItemType Directory -Force
 if (-not $ObjectMode) {
     $null = New-Item -Path $ConfigDir   -ItemType Directory -Force
-    $null = New-Item -Path $EventLogDir -ItemType Directory -Force
 }
 
 $Global:DiagErrorCsv = Join-Path $DiagDir "Get-MIMDiagData_Errors.csv"
@@ -1001,16 +1001,166 @@ function Export-PCNSConfig {
 
 function Export-EventLogs {
     param([string]$OutDir)
-    Write-DiagStatus 'Exporting Event Logs from execution server' Cyan
-    foreach ($logName in @('Application','System','Security')) {
+
+    Write-DiagStatus 'Exporting Event Logs' Cyan
+    New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
+
+    $eventLogScript = {
+        param(
+            [string]$RemoteOut,
+            [string]$LogNamesJson,
+            [int]$Days
+        )
+
+        $ErrorActionPreference = 'SilentlyContinue'
+        $WarningPreference = 'SilentlyContinue'
+        $ProgressPreference = 'SilentlyContinue'
+
+        New-Item -Path $RemoteOut -ItemType Directory -Force | Out-Null
+
+        function New-SafeEventLogFileName {
+            param([string]$Name)
+            $safe = $Name -replace '[\/\\:*?"<>|\s]+','_'
+            $safe = $safe.Trim('_')
+            if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'NoName' }
+            return $safe
+        }
+
+        function Limit-EventLogText {
+            param([string]$Text,[int]$MaxLength=2000)
+            if ($null -eq $Text) { return $null }
+            if ($Text.Length -le $MaxLength) { return $Text }
+            return $Text.Substring(0,$MaxLength) + ' ... [truncated]'
+        }
+
+        $logNames = @()
         try {
-            $evtx = Join-Path $OutDir "$logName.evtx"
-            $csv = Join-Path $OutDir "$logName`_Last$EventLogDays`Days.csv"
-            & wevtutil epl $logName $evtx /ow:true
-            Get-WinEvent -FilterHashtable @{LogName=$logName;StartTime=(Get-Date).AddDays(-1*$EventLogDays)} -ErrorAction Stop | Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,MachineName,Message | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
-        } catch { Write-DiagError -Stage 'Export-EventLogs' -Target $logName -ErrorRecord $_ }
+            $parsed = $LogNamesJson | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed -is [System.Array]) {
+                $logNames = @($parsed | ForEach-Object { [string]$_ })
+            }
+            elseif ($null -ne $parsed) {
+                $logNames = @([string]$parsed)
+            }
+        }
+        catch {
+            $logNames = @()
+        }
+
+        $logNames = @($logNames |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique)
+
+        $statusLines = New-Object System.Collections.Generic.List[string]
+        $statusLines.Add('Event log export status') | Out-Null
+        $statusLines.Add('CSV output is intentionally not created. Event logs are exported as EVTX files only.') | Out-Null
+        $statusLines.Add("ComputerName: $env:COMPUTERNAME") | Out-Null
+        $statusLines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')") | Out-Null
+        $statusLines.Add("RequestedLogNames: $($logNames -join ' | ')") | Out-Null
+        $statusLines.Add('') | Out-Null
+
+        foreach ($logName in $logNames) {
+            $safe = New-SafeEventLogFileName -Name $logName
+            $evtx = Join-Path $RemoteOut "$safe.evtx"
+
+            $statusLines.Add('-----') | Out-Null
+            $statusLines.Add("LogName      : $logName") | Out-Null
+
+            $logInfo = $null
+            try {
+                $logInfo = Get-WinEvent -ListLog $logName -ErrorAction Stop
+            }
+            catch {
+                $message = Limit-EventLogText -Text $_.Exception.Message -MaxLength 1000
+                $statusLines.Add('LogExists    : False') | Out-Null
+                $statusLines.Add('EvtxStatus   : Skipped') | Out-Null
+                $statusLines.Add("EvtxMessage  : $message") | Out-Null
+                $statusLines.Add('') | Out-Null
+                continue
+            }
+
+            $statusLines.Add('LogExists    : True') | Out-Null
+            $statusLines.Add("IsEnabled    : $($logInfo.IsEnabled)") | Out-Null
+            $statusLines.Add("RecordCount  : $($logInfo.RecordCount)") | Out-Null
+
+            $evtxStatus = 'NotRun'
+            $evtxMessage = $null
+
+            try {
+                $wevtutilOutput = & wevtutil.exe epl "$logName" "$evtx" /ow:true 2>&1
+                $exitCode = $LASTEXITCODE
+
+                if ($exitCode -eq 0 -and (Test-Path -LiteralPath $evtx)) {
+                    $evtxStatus = 'Success'
+                    $evtxMessage = 'EVTX file created.'
+                }
+                elseif ($exitCode -eq 0) {
+                    $evtxStatus = 'NoEvtxCreated'
+                    $evtxMessage = 'wevtutil completed but the EVTX file was not found.'
+                }
+                else {
+                    $evtxStatus = 'Failed'
+                    $evtxMessage = "wevtutil exit code: $exitCode. $($wevtutilOutput -join ' ')"
+                }
+            }
+            catch {
+                $evtxStatus = 'Failed'
+                $evtxMessage = Limit-EventLogText -Text $_.Exception.Message -MaxLength 1000
+            }
+
+            $statusLines.Add("EvtxStatus   : $evtxStatus") | Out-Null
+            $statusLines.Add("EvtxMessage  : $evtxMessage") | Out-Null
+            $statusLines.Add("EvtxPath     : $evtx") | Out-Null
+            $statusLines.Add("TimeCreated  : $(Get-Date)") | Out-Null
+            $statusLines.Add('') | Out-Null
+        }
+
+        $statusPath = Join-Path $RemoteOut 'EventLog_ExportStatus.txt'
+        $statusLines | Out-File -FilePath $statusPath -Encoding UTF8
+    }
+
+    $commonLogs = @(
+        'Application',
+        'System',
+        'Security',
+        'Forefront Identity Manager',
+        'Forefront Identity Manager Management Agent'
+    )
+
+    # IMPORTANT:
+    # Use -InputObject here. Pipeline input can flatten or stringify arrays in Windows PowerShell,
+    # which can turn multiple log names into one invalid log name such as
+    # "Application System Security Forefront Identity Manager ...".
+    $commonLogsJson = ConvertTo-Json -InputObject $commonLogs -Compress
+
+    Write-DiagStatus "Exporting Event Logs from ExecutionServer: $env:COMPUTERNAME" Cyan
+    try {
+        & $eventLogScript $OutDir $commonLogsJson $EventLogDays
+    }
+    catch {
+        Write-DiagError -Stage 'Export-EventLogs' -Target $env:COMPUTERNAME -ErrorRecord $_
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SyncServer) -and -not (Test-IsLocalComputer -ComputerName $SyncServer)) {
+        $syncLocalOut = Join-Path $OutDir ("SyncServer_{0}" -f (New-SafeFileName $SyncServer))
+        New-Item -Path $syncLocalOut -ItemType Directory -Force | Out-Null
+
+        Write-DiagStatus "Exporting Event Logs from SyncServer: $SyncServer" Cyan
+        $remoteTemp = New-RemoteWorkPath -Name 'EventLogs_SyncServer'
+
+        try {
+            Invoke-OnComputer -ComputerName $SyncServer -ScriptBlock $eventLogScript -ArgumentList @($remoteTemp, $commonLogsJson, $EventLogDays)
+            Copy-RemoteFolderToLocal -ComputerName $SyncServer -RemotePath $remoteTemp -LocalPath $syncLocalOut
+        }
+        catch {
+            Write-DiagError -Stage 'Export-EventLogs' -Target $SyncServer -ErrorRecord $_
+        }
+        finally {
+            Remove-RemoteTempFolder -ComputerName $SyncServer -RemotePath $remoteTemp -Stage 'Export-EventLogs-CleanupRemoteTemp'
+        }
     }
 }
+
 
 function Export-SystemDiagnostics {
     param([string]$OutDir)
@@ -2780,6 +2930,7 @@ try {
     if ($SkipPCNS -or [string]::IsNullOrWhiteSpace($PcnSServer)) { Write-DiagStatus "PcnSServer: <not specified / skipped>" Green } else { Write-DiagStatus "PcnSServer: $PcnSServer" Green }
     if ($ObjectMode) {
         Export-ObjectDiagnostics -OutDir $SyncDataDir
+        Export-EventLogs -OutDir $EventLogDir
     }
     else {
         Export-SyncDataAll -OutDir $SyncDataDir
@@ -2805,8 +2956,16 @@ try {
         try {
             $zip = "$Root.zip"
             if (Test-Path $zip) { Remove-Item $zip -Force }
+            Write-DiagStatus "Creating ZIP output: $zip" Green
+            Write-DiagStatus 'The uncompressed output root folder will be removed after ZIP creation.' Green
             Compress-Archive -Path (Join-Path $Root '*') -DestinationPath $zip -Force -ErrorAction Stop
-            Write-DiagStatus "ZIP output: $zip" Green
+            try {
+                Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Host ("[{0}] WARN failed to remove output root folder after ZIP creation: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+            Write-Host ("[{0}] ZIP output: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $zip) -ForegroundColor Green
         }
         catch { Write-DiagError -Stage 'Compress-Archive' -Target $Root -ErrorRecord $_ }
     }
