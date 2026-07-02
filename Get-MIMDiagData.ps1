@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     MIM / FIM diagnostic data collector.
 
@@ -895,6 +895,153 @@ function Export-MimServiceConfig {
         $syncRulesFlat = @(Invoke-ExportFimConfigSafe -CustomConfig '/SynchronizationRule' -OnlyBaseResources | ForEach-Object { Convert-FimExportToObject $_ })
         Export-SyncRuleWorkflowMprSetMap -OutDir $OutDir -SyncRules $syncRulesFlat -Workflows $workflows -Mprs $mprs -Sets $sets | Out-Null
     } catch { Write-DiagError -Stage 'Export-MimServiceConfig' -Target 'SyncRule Workflow MPR Set map' -ErrorRecord $_ }
+}
+
+
+function Export-MimInstallationConfigFiles {
+    param([string]$OutDir)
+
+    Write-DiagStatus 'Collecting MIM installation configuration files' Cyan
+
+    function Copy-MimInstallFolderFromComputer {
+        param(
+            [Parameter(Mandatory=$true)][string]$ComputerName,
+            [Parameter(Mandatory=$true)][string]$SourcePath,
+            [Parameter(Mandatory=$true)][string]$DestinationPath,
+            [Parameter(Mandatory=$true)][string]$ComponentName
+        )
+
+        New-Item -Path $DestinationPath -ItemType Directory -Force | Out-Null
+        $remoteTemp = New-RemoteWorkPath -Name ("InstallConfig_{0}_{1}" -f (New-SafeFileName $ComponentName), (New-SafeFileName $ComputerName))
+
+        $scriptBlock = {
+            param(
+                [string]$SourcePath,
+                [string]$RemoteOut,
+                [string]$ComponentName
+            )
+
+            $ErrorActionPreference = 'Stop'
+            $WarningPreference = 'SilentlyContinue'
+            $ProgressPreference = 'SilentlyContinue'
+
+            New-Item -Path $RemoteOut -ItemType Directory -Force | Out-Null
+
+            $copyRows = @()
+            $inventoryRows = @()
+
+            if (-not (Test-Path -LiteralPath $SourcePath)) {
+                [pscustomobject]@{
+                    Component    = $ComponentName
+                    ComputerName = $env:COMPUTERNAME
+                    SourcePath   = $SourcePath
+                    RelativePath = $null
+                    FileName     = $null
+                    Status       = 'SourceNotFound'
+                    Message      = 'Source folder was not found on this computer.'
+                    TimeCreated  = Get-Date
+                } | Export-Csv -Path (Join-Path $RemoteOut '_FileCopyStatus.csv') -NoTypeInformation -Encoding UTF8
+                return
+            }
+
+            $sourceRoot = (Get-Item -LiteralPath $SourcePath).FullName.TrimEnd('\')
+            $files = @(Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force -ErrorAction SilentlyContinue)
+
+            foreach ($file in $files) {
+                $relativePath = $file.FullName.Substring($sourceRoot.Length).TrimStart('\')
+
+                $inventoryRows += [pscustomobject]@{
+                    Component     = $ComponentName
+                    ComputerName  = $env:COMPUTERNAME
+                    SourcePath    = $sourceRoot
+                    FullName      = $file.FullName
+                    RelativePath  = $relativePath
+                    Extension     = $file.Extension
+                    Length        = $file.Length
+                    LastWriteTime = $file.LastWriteTime
+                    TimeCreated   = Get-Date
+                }
+
+                $destinationFile = Join-Path $RemoteOut $relativePath
+                $destinationDir = Split-Path -Path $destinationFile -Parent
+                New-Item -Path $destinationDir -ItemType Directory -Force | Out-Null
+
+                try {
+                    Copy-Item -LiteralPath $file.FullName -Destination $destinationFile -Force -ErrorAction Stop
+                    $copyRows += [pscustomobject]@{
+                        Component    = $ComponentName
+                        ComputerName = $env:COMPUTERNAME
+                        SourcePath   = $sourceRoot
+                        RelativePath = $relativePath
+                        FileName     = $file.Name
+                        Status       = 'Copied'
+                        Message      = $null
+                        TimeCreated  = Get-Date
+                    }
+                }
+                catch {
+                    $copyRows += [pscustomobject]@{
+                        Component    = $ComponentName
+                        ComputerName = $env:COMPUTERNAME
+                        SourcePath   = $sourceRoot
+                        RelativePath = $relativePath
+                        FileName     = $file.Name
+                        Status       = 'Failed'
+                        Message      = $_.Exception.Message
+                        TimeCreated  = Get-Date
+                    }
+                }
+            }
+
+            if ($files.Count -eq 0) {
+                $copyRows += [pscustomobject]@{
+                    Component    = $ComponentName
+                    ComputerName = $env:COMPUTERNAME
+                    SourcePath   = $sourceRoot
+                    RelativePath = $null
+                    FileName     = $null
+                    Status       = 'NoFilesFound'
+                    Message      = 'No files were found under the source folder.'
+                    TimeCreated  = Get-Date
+                }
+            }
+
+            $copyRows | Export-Csv -Path (Join-Path $RemoteOut '_FileCopyStatus.csv') -NoTypeInformation -Encoding UTF8
+            $inventoryRows | Export-Csv -Path (Join-Path $RemoteOut '_SourceFileInventory.csv') -NoTypeInformation -Encoding UTF8
+        }
+
+        try {
+            Invoke-OnComputer -ComputerName $ComputerName -ScriptBlock $scriptBlock -ArgumentList @($SourcePath, $remoteTemp, $ComponentName)
+            Copy-RemoteFolderToLocal -ComputerName $ComputerName -RemotePath $remoteTemp -LocalPath $DestinationPath
+        }
+        catch {
+            Write-DiagError -Stage 'Export-MimInstallationConfigFiles' -Target "$ComputerName $SourcePath" -ErrorRecord $_
+        }
+        finally {
+            Remove-RemoteTempFolder -ComputerName $ComputerName -RemotePath $remoteTemp -Stage 'Export-MimInstallationConfigFiles-CleanupRemoteTemp'
+        }
+    }
+
+    $baseOut = Join-Path $OutDir 'Microsoft Forefront Identity Manager\2010'
+
+    $syncSourcePath = 'C:\Program Files\Microsoft Forefront Identity Manager\2010\Synchronization Service'
+    $syncDestinationPath = Join-Path $baseOut 'Synchronization Service'
+    Copy-MimInstallFolderFromComputer -ComputerName $SyncServer -SourcePath $syncSourcePath -DestinationPath $syncDestinationPath -ComponentName 'Synchronization Service'
+
+    $serviceSourcePath = 'C:\Program Files\Microsoft Forefront Identity Manager\2010\Service'
+    $serviceDestinationPath = Join-Path $baseOut 'Service'
+
+    $serviceComputer = $env:COMPUTERNAME
+    if (-not (Test-Path -LiteralPath $serviceSourcePath)) {
+        if (-not [string]::IsNullOrWhiteSpace($MimServiceServer)) {
+            $serviceComputer = $MimServiceServer
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($MimServiceUri)) {
+            try { $serviceComputer = ([System.Uri]$MimServiceUri).Host } catch {}
+        }
+    }
+
+    Copy-MimInstallFolderFromComputer -ComputerName $serviceComputer -SourcePath $serviceSourcePath -DestinationPath $serviceDestinationPath -ComponentName 'Service'
 }
 
 function Export-PCNSConfig {
@@ -2937,6 +3084,7 @@ try {
         Export-ManagementAgentConfigs -OutDir $ConfigDir
         Export-MetaverseExtensionConfig -OutDir $ConfigDir
         try { Export-MimServiceConfig -OutDir $ConfigDir } catch { Write-DiagError -Stage 'Export-MimServiceConfig' -Target $MimServiceUri -ErrorRecord $_ }
+        Export-MimInstallationConfigFiles -OutDir $ConfigDir
         Export-PCNSConfig -OutDir $ConfigDir
         Export-EventLogs -OutDir $EventLogDir
         Export-SystemDiagnostics -OutDir $DiagDir
