@@ -74,6 +74,7 @@ Get-Command Get-ADDomainController -ErrorAction SilentlyContinue
 
 
 ```powershell
+Install-Module -Name LithnetMIISAutomation -Scope AllUsers -Force
 Import-Module LithnetMIISAutomation -Force -ErrorAction SilentlyContinue
 Get-Command -Module LithnetMIISAutomation -ErrorAction SilentlyContinue
 ```
