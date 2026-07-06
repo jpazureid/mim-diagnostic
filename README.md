@@ -139,7 +139,7 @@ FIMSynchronizationService へのリモート接続ができない環境の場合
   -FIMServiceOnly
 ```
 
-また、その場合は、FIMSynchronizationService サーバー側でも `-FIMSyncOnly` を指定してスクリプトを実行することで診断情報を取得できます。
+また、その場合は、FIMSynchronizationService サーバー側でも `-FIMSyncOnly` を指定してスクリプトを実行することで、各サーバーごとに診断情報を取得できます。
 
 ```powershell
 .\Get-MIMDiagData.ps1 `
