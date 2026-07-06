@@ -312,9 +312,7 @@ Get-ADGroup <GroupName> | Select-Object DistinguishedName
 -DomainAdminName "CONTOSO\Administrator"
 ```
 
-通常診断では、このパラメーターは不要です。
 
----
 
 ---
 
