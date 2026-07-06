@@ -132,12 +132,20 @@ PCNS 情報を取得しない場合は、`-PcnSServer` の代わりに `-SkipPCN
 FIMSynchronizationService へのリモート接続ができない環境の場合は `-FIMServiceOnly` を指定します。
 
 ```powershell
+.\Get-MIMDiagData.ps1 `
+  -Logpath "<診断ログの出力先フォルダー>" `
+  -MimServiceUri "http://<FIMService サーバー名または DNS 名>:5725/ResourceManagementService" `
+  -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>"
   -FIMServiceOnly
 ```
 
 また、その場合は、FIMSynchronizationService サーバー側でも `-FIMSyncOnly` を指定してスクリプトを実行することで診断情報を取得できます。
 
 ```powershell
+.\Get-MIMDiagData.ps1 `
+  -Logpath "<診断ログの出力先フォルダー>" `
+  -SyncServer $env:COMPUTERNAME `
+  -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>"
   -FIMSyncOnly
 ```
 
