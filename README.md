@@ -135,7 +135,7 @@ FIMSynchronizationService へのリモート接続ができない環境の場合
 .\Get-MIMDiagData.ps1 `
   -Logpath "<診断ログの出力先フォルダー>" `
   -MimServiceUri "http://<FIMService サーバー名または DNS 名>:5725/ResourceManagementService" `
-  -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>"
+  -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>" / または -SkipPCNS
   -FIMServiceOnly
 ```
 
@@ -145,7 +145,7 @@ FIMSynchronizationService へのリモート接続ができない環境の場合
 .\Get-MIMDiagData.ps1 `
   -Logpath "<診断ログの出力先フォルダー>" `
   -SyncServer $env:COMPUTERNAME `
-  -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>"
+  -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>" / または -SkipPCNS
   -FIMSyncOnly
 ```
 
