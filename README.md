@@ -129,7 +129,7 @@ PCNS 情報を取得しない場合は、`-PcnSServer` の代わりに `-SkipPCN
   -PcnSServer "<PCNS がインストールされているドメイン コントローラー名>"
 ```
 
-FIMSynchronizationService へのリモート接続ができない環境の場合は `-FIMServiceOnly` を指定します。
+FIMSynchronizationService へ WinRM 接続できない環境の場合は `-FIMServiceOnly` を指定し、FIMService の情報のみ取得します。
 
 ```powershell
 .\Get-MIMDiagData.ps1 `
@@ -139,7 +139,7 @@ FIMSynchronizationService へのリモート接続ができない環境の場合
   -FIMServiceOnly
 ```
 
-また、その場合は、FIMSynchronizationService サーバー側でも `-FIMSyncOnly` を指定してスクリプトを実行することで、各サーバーごとに診断情報を取得できます。
+また、FIMSynchronizationService サーバー側で `-FIMSyncOnly` を指定し、FIMSynchronizationService の情報のみ取得します。
 
 ```powershell
 .\Get-MIMDiagData.ps1 `
