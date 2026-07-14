@@ -1,10 +1,10 @@
-﻿<#
+<#
 .SYNOPSIS
     MIM / FIM diagnostic data collector.
 
 .VERSION
-    Version：Get-MIMDiagData_v1_20.ps1
-    Updated: v1.19 changes event log collection to EVTX-only output, supports both co-located and separated FIMService / FIMSynchronizationService topologies, exports only logs that exist on each target server, adds Forefront Identity Manager and Forefront Identity Manager Management Agent event log collection, and removes the uncompressed output root after ZIP creation. v1.18 expands Connector Space and Metaverse Lithnet Attributes dictionaries into real attribute-value CSV/HTML sections in OBJ mode. v1.17 creates MIM_Diagnostic_Report.html in OBJ mode with AD DS / Connector Space / Metaverse attribute-value sections. v1.16 changes OBJ mode credential input to Get-Credential, removes command-line password usage, and prevents duplicate ConnectorSpace / Metaverse folders under OBJECT_SUMMARY. v1.14 stores all collection output under the -Logpath output root, uses MIMLOG_<timestamp> as the root folder name, and avoids creating temporary working folders under Windows Temp. v1.13 fixes Metaverse extension DataTable handling and Windows PowerShell Out-File compatibility. v1.12 fixes Metaverse rules extension collection when running from the FIMService server by avoiding SQL double-hop authentication. v1.11 added Metaverse rules extension configuration/DLL collection and includes it in the HTML report. Previous updates: v1.10 removes MA XML parse-check output and fixes UTF-8 reading for MA XML Japanese OU names; quiet mode by default, service/portal build collection, SharePoint version collection, name resolution/DC inventory, robust MA XML summary parsing, optional PCNS collection, improved best-effort metaverse object extraction for OBJ mode, skips CONFIG folder in OBJ mode, and creates an HTML summary report.
+    Version：Get-MIMDiagData_v1_19.ps1
+    Updated: v1.14 stores all collection output under the -Logpath output root, uses MIMLOG_<timestamp> as the root folder name, and avoids creating temporary working folders under Windows Temp. v1.13 fixes Metaverse extension DataTable handling and Windows PowerShell Out-File compatibility. v1.12 fixes Metaverse rules extension collection when running from the FIMService server by avoiding SQL double-hop authentication. v1.11 added Metaverse rules extension configuration/DLL collection and includes it in the HTML report. Previous updates: v1.10 removes MA XML parse-check output and fixes UTF-8 reading for MA XML Japanese OU names; quiet mode by default, service/portal build collection, SharePoint version collection, name resolution/DC inventory, robust MA XML summary parsing, optional PCNS collection, improved best-effort metaverse object extraction for OBJ mode, skips CONFIG/EVENTLOG folders in OBJ mode, and creates an HTML summary report.
 
 .USAGE
     Note: MIM ポータルを利用していない環境の場合は、-MimServiceUri は不要です。
@@ -13,7 +13,7 @@
       .\Get-MIMDiagData.ps1 -Logpath C:\Temp\MIMDiag -SyncServer WIN-U74H5QBQ28C -MimServiceUri http://WIN-M6F0SOQJ62G.contoso.com:5725/ResourceManagementService [-PcnSServer <DCName>]
 
     OBJ mode:
-      .\Get-MIMDiagData.ps1 -Logpath C:\Temp\MIMDiag -SyncServer <SyncServer> -MimServiceUri <MIMServiceUri> -GetObjDomainName contoso.com -GetObjADdn "CN=user1,OU=SyncUsers,DC=contoso,DC=com" -DomainAdminName "CONTOSO\Administrator"
+      .\Get-MIMDiagData.ps1 -Logpath C:\Temp\MIMDiag -SyncServer <SyncServer> -GetObjDomainName contoso.com -GetObjADdn "CN=user1,OU=SyncUsers,DC=contoso,DC=com" -DomainAdminName "CONTOSO\Administrator"
 
 .NOTES
     - Run in elevated Windows PowerShell.
@@ -43,7 +43,11 @@ param(
 
     [int]$EventLogDays = 7,
 
-    [switch]$NoZip,
+    # Run only FIMService-side diagnostics. Use this on the FIMService server when WinRM to the FIMSynchronizationService server is not available.
+    [switch]$FIMServiceOnly,
+
+    # Run only FIMSynchronizationService-side diagnostics. Use this on the FIMSynchronizationService server when WinRM from the FIMService server is not available.
+    [switch]$FIMSyncOnly,
 
     # Default behavior is quiet: errors are recorded to files but not printed in red.
     [switch]$ShowErrors,
@@ -67,19 +71,27 @@ if (-not (Test-Path -LiteralPath $Logpath)) {
 
 $ObjectMode = -not [string]::IsNullOrWhiteSpace($GetObjADdn)
 
-$Root        = Join-Path $Logpath "MIMLOG_$TimeStamp"
+if ($FIMServiceOnly -and $FIMSyncOnly) {
+    throw "-FIMServiceOnly and -FIMSyncOnly cannot be specified together."
+}
+
+$RootPrefix = "MIMLOG"
+if ($FIMServiceOnly) { $RootPrefix = "MIMLOG_FIMSERVICE" }
+elseif ($FIMSyncOnly) { $RootPrefix = "MIMLOG_FIMSYNC" }
+
+$Root        = Join-Path $Logpath "${RootPrefix}_$TimeStamp"
 $SyncDataDir = Join-Path $Root "SYNC DATA"
 $ConfigDir   = Join-Path $Root "CONFIG"
 $EventLogDir = Join-Path $Root "EVENTLOG"
 $DiagDir     = Join-Path $Root "DIAGNOSTIC"
 
-# OBJ mode collects object-focused diagnostics and event logs.
-# CONFIG is not created in OBJ mode because MIM Service configuration collection is not used there.
+# OBJ mode collects only object-focused diagnostics.
+# Do not create CONFIG / EVENTLOG folders in OBJ mode because they are not used.
 $null = New-Item -Path $SyncDataDir -ItemType Directory -Force
 $null = New-Item -Path $DiagDir     -ItemType Directory -Force
-$null = New-Item -Path $EventLogDir -ItemType Directory -Force
 if (-not $ObjectMode) {
     $null = New-Item -Path $ConfigDir   -ItemType Directory -Force
+    $null = New-Item -Path $EventLogDir -ItemType Directory -Force
 }
 
 $Global:DiagErrorCsv = Join-Path $DiagDir "Get-MIMDiagData_Errors.csv"
@@ -93,7 +105,8 @@ if ($ObjectMode) {
     if ($missing.Count -gt 0) { throw "OBJ mode requires: $($missing -join ', ')" }
 }
 
-if (-not $MimServiceUri) {
+# OBJ mode and FIMSyncOnly do not require FIMService ResourceManagementService URI.
+if (-not $MimServiceUri -and -not $ObjectMode -and -not $FIMSyncOnly) {
     if ($MimServiceServer) {
         $MimServiceUri = "http://$MimServiceServer`:5725/ResourceManagementService"
     }
@@ -897,153 +910,6 @@ function Export-MimServiceConfig {
     } catch { Write-DiagError -Stage 'Export-MimServiceConfig' -Target 'SyncRule Workflow MPR Set map' -ErrorRecord $_ }
 }
 
-
-function Export-MimInstallationConfigFiles {
-    param([string]$OutDir)
-
-    Write-DiagStatus 'Collecting MIM installation configuration files' Cyan
-
-    function Copy-MimInstallFolderFromComputer {
-        param(
-            [Parameter(Mandatory=$true)][string]$ComputerName,
-            [Parameter(Mandatory=$true)][string]$SourcePath,
-            [Parameter(Mandatory=$true)][string]$DestinationPath,
-            [Parameter(Mandatory=$true)][string]$ComponentName
-        )
-
-        New-Item -Path $DestinationPath -ItemType Directory -Force | Out-Null
-        $remoteTemp = New-RemoteWorkPath -Name ("InstallConfig_{0}_{1}" -f (New-SafeFileName $ComponentName), (New-SafeFileName $ComputerName))
-
-        $scriptBlock = {
-            param(
-                [string]$SourcePath,
-                [string]$RemoteOut,
-                [string]$ComponentName
-            )
-
-            $ErrorActionPreference = 'Stop'
-            $WarningPreference = 'SilentlyContinue'
-            $ProgressPreference = 'SilentlyContinue'
-
-            New-Item -Path $RemoteOut -ItemType Directory -Force | Out-Null
-
-            $copyRows = @()
-            $inventoryRows = @()
-
-            if (-not (Test-Path -LiteralPath $SourcePath)) {
-                [pscustomobject]@{
-                    Component    = $ComponentName
-                    ComputerName = $env:COMPUTERNAME
-                    SourcePath   = $SourcePath
-                    RelativePath = $null
-                    FileName     = $null
-                    Status       = 'SourceNotFound'
-                    Message      = 'Source folder was not found on this computer.'
-                    TimeCreated  = Get-Date
-                } | Export-Csv -Path (Join-Path $RemoteOut '_FileCopyStatus.csv') -NoTypeInformation -Encoding UTF8
-                return
-            }
-
-            $sourceRoot = (Get-Item -LiteralPath $SourcePath).FullName.TrimEnd('\')
-            $files = @(Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force -ErrorAction SilentlyContinue)
-
-            foreach ($file in $files) {
-                $relativePath = $file.FullName.Substring($sourceRoot.Length).TrimStart('\')
-
-                $inventoryRows += [pscustomobject]@{
-                    Component     = $ComponentName
-                    ComputerName  = $env:COMPUTERNAME
-                    SourcePath    = $sourceRoot
-                    FullName      = $file.FullName
-                    RelativePath  = $relativePath
-                    Extension     = $file.Extension
-                    Length        = $file.Length
-                    LastWriteTime = $file.LastWriteTime
-                    TimeCreated   = Get-Date
-                }
-
-                $destinationFile = Join-Path $RemoteOut $relativePath
-                $destinationDir = Split-Path -Path $destinationFile -Parent
-                New-Item -Path $destinationDir -ItemType Directory -Force | Out-Null
-
-                try {
-                    Copy-Item -LiteralPath $file.FullName -Destination $destinationFile -Force -ErrorAction Stop
-                    $copyRows += [pscustomobject]@{
-                        Component    = $ComponentName
-                        ComputerName = $env:COMPUTERNAME
-                        SourcePath   = $sourceRoot
-                        RelativePath = $relativePath
-                        FileName     = $file.Name
-                        Status       = 'Copied'
-                        Message      = $null
-                        TimeCreated  = Get-Date
-                    }
-                }
-                catch {
-                    $copyRows += [pscustomobject]@{
-                        Component    = $ComponentName
-                        ComputerName = $env:COMPUTERNAME
-                        SourcePath   = $sourceRoot
-                        RelativePath = $relativePath
-                        FileName     = $file.Name
-                        Status       = 'Failed'
-                        Message      = $_.Exception.Message
-                        TimeCreated  = Get-Date
-                    }
-                }
-            }
-
-            if ($files.Count -eq 0) {
-                $copyRows += [pscustomobject]@{
-                    Component    = $ComponentName
-                    ComputerName = $env:COMPUTERNAME
-                    SourcePath   = $sourceRoot
-                    RelativePath = $null
-                    FileName     = $null
-                    Status       = 'NoFilesFound'
-                    Message      = 'No files were found under the source folder.'
-                    TimeCreated  = Get-Date
-                }
-            }
-
-            $copyRows | Export-Csv -Path (Join-Path $RemoteOut '_FileCopyStatus.csv') -NoTypeInformation -Encoding UTF8
-            $inventoryRows | Export-Csv -Path (Join-Path $RemoteOut '_SourceFileInventory.csv') -NoTypeInformation -Encoding UTF8
-        }
-
-        try {
-            Invoke-OnComputer -ComputerName $ComputerName -ScriptBlock $scriptBlock -ArgumentList @($SourcePath, $remoteTemp, $ComponentName)
-            Copy-RemoteFolderToLocal -ComputerName $ComputerName -RemotePath $remoteTemp -LocalPath $DestinationPath
-        }
-        catch {
-            Write-DiagError -Stage 'Export-MimInstallationConfigFiles' -Target "$ComputerName $SourcePath" -ErrorRecord $_
-        }
-        finally {
-            Remove-RemoteTempFolder -ComputerName $ComputerName -RemotePath $remoteTemp -Stage 'Export-MimInstallationConfigFiles-CleanupRemoteTemp'
-        }
-    }
-
-    $baseOut = Join-Path $OutDir 'Microsoft Forefront Identity Manager\2010'
-
-    $syncSourcePath = 'C:\Program Files\Microsoft Forefront Identity Manager\2010\Synchronization Service'
-    $syncDestinationPath = Join-Path $baseOut 'Synchronization Service'
-    Copy-MimInstallFolderFromComputer -ComputerName $SyncServer -SourcePath $syncSourcePath -DestinationPath $syncDestinationPath -ComponentName 'Synchronization Service'
-
-    $serviceSourcePath = 'C:\Program Files\Microsoft Forefront Identity Manager\2010\Service'
-    $serviceDestinationPath = Join-Path $baseOut 'Service'
-
-    $serviceComputer = $env:COMPUTERNAME
-    if (-not (Test-Path -LiteralPath $serviceSourcePath)) {
-        if (-not [string]::IsNullOrWhiteSpace($MimServiceServer)) {
-            $serviceComputer = $MimServiceServer
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($MimServiceUri)) {
-            try { $serviceComputer = ([System.Uri]$MimServiceUri).Host } catch {}
-        }
-    }
-
-    Copy-MimInstallFolderFromComputer -ComputerName $serviceComputer -SourcePath $serviceSourcePath -DestinationPath $serviceDestinationPath -ComponentName 'Service'
-}
-
 function Export-PCNSConfig {
     param([string]$OutDir)
     $pcnsDir = Join-Path $OutDir 'PCNS'
@@ -1148,166 +1014,47 @@ function Export-PCNSConfig {
 
 function Export-EventLogs {
     param([string]$OutDir)
+    Write-DiagStatus 'Exporting Event Logs from execution server' Cyan
 
-    Write-DiagStatus 'Exporting Event Logs' Cyan
-    New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
+    $statusPath = Join-Path $OutDir 'EventLog_ExportStatus.txt'
+    $logsToExport = @(
+        @{LogName='Application'; FileName='Application.evtx'},
+        @{LogName='System'; FileName='System.evtx'},
+        @{LogName='Security'; FileName='Security.evtx'},
+        @{LogName='Forefront Identity Manager'; FileName='Forefront_Identity_Manager.evtx'},
+        @{LogName='Forefront Identity Manager Management Agent'; FileName='Forefront_Identity_Manager_Management_Agent.evtx'}
+    )
 
-    $eventLogScript = {
-        param(
-            [string]$RemoteOut,
-            [string]$LogNamesJson,
-            [int]$Days
-        )
-
-        $ErrorActionPreference = 'SilentlyContinue'
-        $WarningPreference = 'SilentlyContinue'
-        $ProgressPreference = 'SilentlyContinue'
-
-        New-Item -Path $RemoteOut -ItemType Directory -Force | Out-Null
-
-        function New-SafeEventLogFileName {
-            param([string]$Name)
-            $safe = $Name -replace '[\/\\:*?"<>|\s]+','_'
-            $safe = $safe.Trim('_')
-            if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'NoName' }
-            return $safe
-        }
-
-        function Limit-EventLogText {
-            param([string]$Text,[int]$MaxLength=2000)
-            if ($null -eq $Text) { return $null }
-            if ($Text.Length -le $MaxLength) { return $Text }
-            return $Text.Substring(0,$MaxLength) + ' ... [truncated]'
-        }
-
-        $logNames = @()
+    $statusLines = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $logsToExport) {
+        $logName = $item.LogName
+        $fileName = $item.FileName
         try {
-            $parsed = $LogNamesJson | ConvertFrom-Json -ErrorAction Stop
-            if ($parsed -is [System.Array]) {
-                $logNames = @($parsed | ForEach-Object { [string]$_ })
-            }
-            elseif ($null -ne $parsed) {
-                $logNames = @([string]$parsed)
-            }
-        }
-        catch {
-            $logNames = @()
-        }
-
-        $logNames = @($logNames |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Sort-Object -Unique)
-
-        $statusLines = New-Object System.Collections.Generic.List[string]
-        $statusLines.Add('Event log export status') | Out-Null
-        $statusLines.Add('CSV output is intentionally not created. Event logs are exported as EVTX files only.') | Out-Null
-        $statusLines.Add("ComputerName: $env:COMPUTERNAME") | Out-Null
-        $statusLines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')") | Out-Null
-        $statusLines.Add("RequestedLogNames: $($logNames -join ' | ')") | Out-Null
-        $statusLines.Add('') | Out-Null
-
-        foreach ($logName in $logNames) {
-            $safe = New-SafeEventLogFileName -Name $logName
-            $evtx = Join-Path $RemoteOut "$safe.evtx"
-
-            $statusLines.Add('-----') | Out-Null
-            $statusLines.Add("LogName      : $logName") | Out-Null
-
-            $logInfo = $null
-            try {
-                $logInfo = Get-WinEvent -ListLog $logName -ErrorAction Stop
-            }
-            catch {
-                $message = Limit-EventLogText -Text $_.Exception.Message -MaxLength 1000
-                $statusLines.Add('LogExists    : False') | Out-Null
-                $statusLines.Add('EvtxStatus   : Skipped') | Out-Null
-                $statusLines.Add("EvtxMessage  : $message") | Out-Null
-                $statusLines.Add('') | Out-Null
+            $logInfo = Get-WinEvent -ListLog $logName -ErrorAction Stop
+            if (-not $logInfo) {
+                $statusLines.Add("Skipped`t$logName`tLog not found")
                 continue
             }
 
-            $statusLines.Add('LogExists    : True') | Out-Null
-            $statusLines.Add("IsEnabled    : $($logInfo.IsEnabled)") | Out-Null
-            $statusLines.Add("RecordCount  : $($logInfo.RecordCount)") | Out-Null
-
-            $evtxStatus = 'NotRun'
-            $evtxMessage = $null
-
-            try {
-                $wevtutilOutput = & wevtutil.exe epl "$logName" "$evtx" /ow:true 2>&1
-                $exitCode = $LASTEXITCODE
-
-                if ($exitCode -eq 0 -and (Test-Path -LiteralPath $evtx)) {
-                    $evtxStatus = 'Success'
-                    $evtxMessage = 'EVTX file created.'
-                }
-                elseif ($exitCode -eq 0) {
-                    $evtxStatus = 'NoEvtxCreated'
-                    $evtxMessage = 'wevtutil completed but the EVTX file was not found.'
-                }
-                else {
-                    $evtxStatus = 'Failed'
-                    $evtxMessage = "wevtutil exit code: $exitCode. $($wevtutilOutput -join ' ')"
-                }
+            $evtx = Join-Path $OutDir $fileName
+            Write-DiagStatus "Exporting Event Log: $logName" Cyan
+            & wevtutil epl $logName $evtx /ow:true
+            if (Test-Path -LiteralPath $evtx) {
+                $statusLines.Add("Exported`t$logName`t$evtx")
             }
-            catch {
-                $evtxStatus = 'Failed'
-                $evtxMessage = Limit-EventLogText -Text $_.Exception.Message -MaxLength 1000
+            else {
+                $statusLines.Add("Failed`t$logName`tEVTX file was not created")
             }
-
-            $statusLines.Add("EvtxStatus   : $evtxStatus") | Out-Null
-            $statusLines.Add("EvtxMessage  : $evtxMessage") | Out-Null
-            $statusLines.Add("EvtxPath     : $evtx") | Out-Null
-            $statusLines.Add("TimeCreated  : $(Get-Date)") | Out-Null
-            $statusLines.Add('') | Out-Null
-        }
-
-        $statusPath = Join-Path $RemoteOut 'EventLog_ExportStatus.txt'
-        $statusLines | Out-File -FilePath $statusPath -Encoding UTF8
-    }
-
-    $commonLogs = @(
-        'Application',
-        'System',
-        'Security',
-        'Forefront Identity Manager',
-        'Forefront Identity Manager Management Agent'
-    )
-
-    # IMPORTANT:
-    # Use -InputObject here. Pipeline input can flatten or stringify arrays in Windows PowerShell,
-    # which can turn multiple log names into one invalid log name such as
-    # "Application System Security Forefront Identity Manager ...".
-    $commonLogsJson = ConvertTo-Json -InputObject $commonLogs -Compress
-
-    Write-DiagStatus "Exporting Event Logs from ExecutionServer: $env:COMPUTERNAME" Cyan
-    try {
-        & $eventLogScript $OutDir $commonLogsJson $EventLogDays
-    }
-    catch {
-        Write-DiagError -Stage 'Export-EventLogs' -Target $env:COMPUTERNAME -ErrorRecord $_
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($SyncServer) -and -not (Test-IsLocalComputer -ComputerName $SyncServer)) {
-        $syncLocalOut = Join-Path $OutDir ("SyncServer_{0}" -f (New-SafeFileName $SyncServer))
-        New-Item -Path $syncLocalOut -ItemType Directory -Force | Out-Null
-
-        Write-DiagStatus "Exporting Event Logs from SyncServer: $SyncServer" Cyan
-        $remoteTemp = New-RemoteWorkPath -Name 'EventLogs_SyncServer'
-
-        try {
-            Invoke-OnComputer -ComputerName $SyncServer -ScriptBlock $eventLogScript -ArgumentList @($remoteTemp, $commonLogsJson, $EventLogDays)
-            Copy-RemoteFolderToLocal -ComputerName $SyncServer -RemotePath $remoteTemp -LocalPath $syncLocalOut
         }
         catch {
-            Write-DiagError -Stage 'Export-EventLogs' -Target $SyncServer -ErrorRecord $_
-        }
-        finally {
-            Remove-RemoteTempFolder -ComputerName $SyncServer -RemotePath $remoteTemp -Stage 'Export-EventLogs-CleanupRemoteTemp'
+            $msg = Limit-Text -Text $_.Exception.Message -MaxLength 500
+            $statusLines.Add("Skipped`t$logName`t$msg")
+            Write-DiagError -Stage 'Export-EventLogs' -Target $logName -ErrorRecord $_
         }
     }
-}
 
+    $statusLines | Out-File -FilePath $statusPath -Encoding UTF8
+}
 
 function Export-SystemDiagnostics {
     param([string]$OutDir)
@@ -1764,96 +1511,34 @@ function Export-NetworkDiagnostics {
 
 function Export-ObjectDiagnostics {
     param([string]$OutDir)
-
     Write-DiagStatus "Running OBJ mode diagnostics for DN: $GetObjADdn" Cyan
-
-    $adDir      = Join-Path $OutDir 'OBJECT_ADDS'
-    $csDir      = Join-Path $OutDir 'OBJECT_CONNECTOR_SPACE'
-    $mvDir      = Join-Path $OutDir 'OBJECT_METAVERSE'
-    $summaryDir = Join-Path $OutDir 'OBJECT_SUMMARY'
-
-    New-Item -Path $adDir      -ItemType Directory -Force | Out-Null
-    New-Item -Path $csDir      -ItemType Directory -Force | Out-Null
-    New-Item -Path $mvDir      -ItemType Directory -Force | Out-Null
-    New-Item -Path $summaryDir -ItemType Directory -Force | Out-Null
-
+    $adDir = Join-Path $OutDir 'OBJECT_ADDS'; $csDir = Join-Path $OutDir 'OBJECT_CONNECTOR_SPACE'; $mvDir = Join-Path $OutDir 'OBJECT_METAVERSE'
+    New-Item -Path $adDir -ItemType Directory -Force | Out-Null; New-Item -Path $csDir -ItemType Directory -Force | Out-Null; New-Item -Path $mvDir -ItemType Directory -Force | Out-Null
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
-
+        Write-DiagStatus "Prompting for AD credential: $DomainAdminName" Cyan
+        Write-DiagStatus "A credential dialog will be displayed. If it is hidden, check behind the PowerShell window or press Alt+Tab." DarkYellow
         $cred = Get-Credential -UserName $DomainAdminName -Message 'Enter credentials for AD object collection.'
-        if ($null -eq $cred) {
-            throw 'Credential input was cancelled or no credential was provided.'
-        }
-
-        $obj = Get-ADObject `
-            -Server $GetObjDomainName `
-            -Identity $GetObjADdn `
-            -Credential $cred `
-            -Properties * `
-            -ErrorAction Stop
-
+        Write-DiagStatus "AD credential input completed. Collecting AD object from $GetObjDomainName." Cyan
+        $obj = Get-ADObject -Server $GetObjDomainName -Identity $GetObjADdn -Credential $cred -Properties * -ErrorAction Stop
+        Write-DiagStatus "AD object collected. Exporting AD object files." Cyan
         $obj | Format-List * | Out-File -FilePath (Join-Path $adDir 'ADDS_Object.txt') -Encoding UTF8
         $obj | Export-Clixml -Path (Join-Path $adDir 'ADDS_Object.clixml')
         $obj | Select-Object * | Export-Csv -Path (Join-Path $adDir 'ADDS_Object.csv') -NoTypeInformation -Encoding UTF8
-
-        $adPropertyRows = foreach ($p in $obj.PSObject.Properties) {
-            $value = $p.Value
-            $valueText = if ($null -eq $value) {
-                $null
-            }
-            elseif ($value -is [string]) {
-                $value
-            }
-            elseif ($value -is [System.Collections.IEnumerable]) {
-                (@($value) | ForEach-Object { [string]$_ }) -join '; '
-            }
-            else {
-                [string]$value
-            }
-
-            [pscustomobject]@{
-                Name        = $p.Name
-                TypeName    = if ($null -ne $value) { $value.GetType().FullName } else { $null }
-                ValueSample = $valueText
-            }
-        }
-
-        $adPropertyRows | Export-Csv -Path (Join-Path $adDir 'ADDS_Object_PropertySummary.csv') -NoTypeInformation -Encoding UTF8
-
-        $adAttributeRows = foreach ($row in $adPropertyRows) {
-            [pscustomobject]@{
-                DataStore     = 'AD DS'
-                ObjectKind    = 'ADObject'
-                AttributeName = $row.Name
-                Value         = $row.ValueSample
-                TypeName      = $row.TypeName
-            }
-        }
-        $adAttributeRows | Export-Csv -Path (Join-Path $adDir 'ADDS_Object_Attributes.csv') -NoTypeInformation -Encoding UTF8
-    }
-    catch {
-        Write-DiagError -Stage 'Export-ObjectDiagnostics' -Target "ADDS $GetObjADdn" -ErrorRecord $_
-    }
-
+    } catch { Write-DiagError -Stage 'Export-ObjectDiagnostics' -Target "ADDS $GetObjADdn" -ErrorRecord $_ }
     $remoteTemp = New-RemoteWorkPath -Name "Object"
-
     $scriptBlock = {
         param($RemoteOut,$DN)
-
         Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
         $ErrorActionPreference = 'SilentlyContinue'
         $WarningPreference = 'SilentlyContinue'
         $ProgressPreference = 'SilentlyContinue'
 
         New-Item -Path $RemoteOut -ItemType Directory -Force | Out-Null
-
-        $csDirRemote      = Join-Path $RemoteOut 'ConnectorSpace'
-        $mvDirRemote      = Join-Path $RemoteOut 'Metaverse'
-        $summaryDirRemote = Join-Path $RemoteOut 'Summary'
-
-        New-Item -Path $csDirRemote      -ItemType Directory -Force | Out-Null
-        New-Item -Path $mvDirRemote      -ItemType Directory -Force | Out-Null
-        New-Item -Path $summaryDirRemote -ItemType Directory -Force | Out-Null
+        $csDir = Join-Path $RemoteOut 'ConnectorSpace'
+        $mvDir = Join-Path $RemoteOut 'Metaverse'
+        New-Item -Path $csDir -ItemType Directory -Force | Out-Null
+        New-Item -Path $mvDir -ItemType Directory -Force | Out-Null
 
         function New-SafeRemoteFileName {
             param([string]$Name)
@@ -1887,196 +1572,6 @@ function Export-ObjectDiagnostics {
                         ValueSample = Limit-RemoteText -Text ([string]$p.Value) -MaxLength 800
                     }
                 }
-                $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
-            } catch {}
-        }
-
-        function Convert-RemoteSingleValueToText {
-            param($Value,[int]$MaxLength=4000)
-
-            if ($null -eq $Value) { return $null }
-
-            if ($Value -is [string]) {
-                return (Limit-RemoteText -Text $Value -MaxLength $MaxLength)
-            }
-
-            if ($Value -is [byte[]]) {
-                try { return ([System.Convert]::ToBase64String($Value)) } catch { return ([string]$Value) }
-            }
-
-            foreach ($propName in @('Value','StringValue','DisplayValue','DN','Id','ID','ObjectID','ObjectId','Guid')) {
-                try {
-                    $prop = $Value.PSObject.Properties[$propName]
-                    if ($prop -and $null -ne $prop.Value) {
-                        return (Convert-RemoteSingleValueToText -Value $prop.Value -MaxLength $MaxLength)
-                    }
-                } catch {}
-            }
-
-            return (Limit-RemoteText -Text ([string]$Value) -MaxLength $MaxLength)
-        }
-
-        function Convert-RemoteValueCollectionToText {
-            param($Value,[int]$MaxLength=4000)
-
-            if ($null -eq $Value) { return $null }
-
-            if ($Value -is [string] -or $Value -is [byte[]]) {
-                return (Convert-RemoteSingleValueToText -Value $Value -MaxLength $MaxLength)
-            }
-
-            if ($Value -is [System.Collections.IEnumerable]) {
-                $items = @()
-                foreach ($item in $Value) {
-                    $itemText = Convert-RemoteSingleValueToText -Value $item -MaxLength $MaxLength
-                    if (-not [string]::IsNullOrWhiteSpace($itemText)) { $items += $itemText }
-                }
-                return (Limit-RemoteText -Text ($items -join '; ') -MaxLength $MaxLength)
-            }
-
-            return (Convert-RemoteSingleValueToText -Value $Value -MaxLength $MaxLength)
-        }
-
-        function Get-RemotePropertyValue {
-            param($Object,[string[]]$Names)
-            if ($null -eq $Object) { return $null }
-            foreach ($name in $Names) {
-                try {
-                    $prop = $Object.PSObject.Properties[$name]
-                    if ($prop -and $null -ne $prop.Value) { return $prop.Value }
-                } catch {}
-            }
-            return $null
-        }
-
-        function Get-RemoteAttributeRows {
-            param(
-                $Object,
-                [string]$DataStore,
-                [string]$MAName,
-                [string]$ObjectKind
-            )
-
-            $rows = @()
-            if ($null -eq $Object) { return $rows }
-
-            $sourceObjectId = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $Object -Names @('ID','Id','ObjectID','ObjectId','DN','DistinguishedName')) -MaxLength 1000
-            $objectType = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $Object -Names @('ObjectType','Type')) -MaxLength 1000
-
-            $attrContainer = $null
-            try {
-                $attrProp = $Object.PSObject.Properties['Attributes']
-                if ($attrProp) { $attrContainer = $attrProp.Value }
-            } catch {}
-
-            if ($null -ne $attrContainer) {
-                $keys = @()
-                try { $keys = @($attrContainer.Keys) } catch {}
-
-                if ($keys.Count -gt 0) {
-                    foreach ($key in ($keys | Sort-Object)) {
-                        $attr = $null
-                        try { $attr = $attrContainer[$key] } catch {}
-                        if ($null -eq $attr) { try { $attr = $attrContainer.Item($key) } catch {} }
-                        if ($null -eq $attr) { continue }
-
-                        $attrName = [string]$key
-                        $nameFromObject = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('Name','AttributeName')) -MaxLength 1000
-                        if (-not [string]::IsNullOrWhiteSpace($nameFromObject)) { $attrName = $nameFromObject }
-
-                        $rawValue = Get-RemotePropertyValue -Object $attr -Names @('Values','Value','StringValues','RawValues')
-                        if ($null -eq $rawValue) { $rawValue = $attr }
-
-                        $valueText = Convert-RemoteValueCollectionToText -Value $rawValue -MaxLength 8000
-                        $valueCount = $null
-                        try {
-                            if ($rawValue -is [string] -or $rawValue -is [byte[]] -or $null -eq $rawValue) { $valueCount = if ($null -eq $rawValue) { 0 } else { 1 } }
-                            elseif ($rawValue -is [System.Collections.IEnumerable]) { $valueCount = @($rawValue).Count }
-                            else { $valueCount = 1 }
-                        } catch {}
-
-                        $rows += [pscustomobject]@{
-                            DataStore      = $DataStore
-                            MAName         = $MAName
-                            ObjectKind     = $ObjectKind
-                            ObjectType     = $objectType
-                            SourceObjectId = $sourceObjectId
-                            AttributeName  = $attrName
-                            Value          = $valueText
-                            ValueCount     = $valueCount
-                            TypeName       = if ($null -ne $attr) { $attr.GetType().FullName } else { $null }
-                            AttributeType  = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('Type','DataType','AttributeType')) -MaxLength 1000
-                            ContributingMA = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('ContributingMA','ContributingManagementAgent','ContributingMAName')) -MaxLength 1000
-                            LastModified   = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('LastModified','LastModificationTime','LastWriteTime')) -MaxLength 1000
-                        }
-                    }
-                }
-                else {
-                    foreach ($entry in $attrContainer) {
-                        $key = Get-RemotePropertyValue -Object $entry -Names @('Key','Name')
-                        $attr = Get-RemotePropertyValue -Object $entry -Names @('Value')
-                        if ($null -eq $attr) { $attr = $entry }
-                        $attrName = Convert-RemoteValueCollectionToText -Value $key -MaxLength 1000
-                        if ([string]::IsNullOrWhiteSpace($attrName)) {
-                            $attrName = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('Name','AttributeName')) -MaxLength 1000
-                        }
-                        if ([string]::IsNullOrWhiteSpace($attrName)) { continue }
-
-                        $rawValue = Get-RemotePropertyValue -Object $attr -Names @('Values','Value','StringValues','RawValues')
-                        if ($null -eq $rawValue) { $rawValue = $attr }
-
-                        $rows += [pscustomobject]@{
-                            DataStore      = $DataStore
-                            MAName         = $MAName
-                            ObjectKind     = $ObjectKind
-                            ObjectType     = $objectType
-                            SourceObjectId = $sourceObjectId
-                            AttributeName  = $attrName
-                            Value          = Convert-RemoteValueCollectionToText -Value $rawValue -MaxLength 8000
-                            ValueCount     = $null
-                            TypeName       = if ($null -ne $attr) { $attr.GetType().FullName } else { $null }
-                            AttributeType  = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('Type','DataType','AttributeType')) -MaxLength 1000
-                            ContributingMA = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('ContributingMA','ContributingManagementAgent','ContributingMAName')) -MaxLength 1000
-                            LastModified   = Convert-RemoteValueCollectionToText -Value (Get-RemotePropertyValue -Object $attr -Names @('LastModified','LastModificationTime','LastWriteTime')) -MaxLength 1000
-                        }
-                    }
-                }
-            }
-
-            if ($rows.Count -eq 0) {
-                foreach ($p in $Object.PSObject.Properties) {
-                    if ($p.Name -in @('Attributes','CSMVLinks','Connectors')) { continue }
-                    $rows += [pscustomobject]@{
-                        DataStore      = $DataStore
-                        MAName         = $MAName
-                        ObjectKind     = $ObjectKind
-                        ObjectType     = $objectType
-                        SourceObjectId = $sourceObjectId
-                        AttributeName  = $p.Name
-                        Value          = Convert-RemoteValueCollectionToText -Value $p.Value -MaxLength 8000
-                        ValueCount     = $null
-                        TypeName       = if ($null -ne $p.Value) { $p.Value.GetType().FullName } else { $null }
-                        AttributeType  = $null
-                        ContributingMA = $null
-                        LastModified   = $null
-                    }
-                }
-            }
-
-            return $rows
-        }
-
-        function Export-LithnetAttributeRows {
-            param(
-                $Object,
-                [string]$Path,
-                [string]$DataStore,
-                [string]$MAName,
-                [string]$ObjectKind
-            )
-
-            try {
-                $rows = @(Get-RemoteAttributeRows -Object $Object -DataStore $DataStore -MAName $MAName -ObjectKind $ObjectKind)
                 $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
             } catch {}
         }
@@ -2168,7 +1663,6 @@ function Export-ObjectDiagnostics {
                 @{ MVObjectID = $id },
                 @{ MVObjectId = $id }
             )
-
             foreach ($params in $attempts) {
                 $r = Invoke-CommandIfParametersExist -CommandName 'Get-MVObject' -Parameters $params
                 if ($r) { return $r }
@@ -2179,7 +1673,6 @@ function Export-ObjectDiagnostics {
         function Try-SearchMvObjectByAnchor {
             param([string]$Anchor)
             if ([string]::IsNullOrWhiteSpace($Anchor)) { return $null }
-
             $attrs = @('accountName','AccountName','sAMAccountName','uid','displayName')
             $commands = @('Get-MVObject','Search-MVObject')
 
@@ -2196,219 +1689,151 @@ function Export-ObjectDiagnostics {
                         @{ Filter = "$attr='$Anchor'" },
                         @{ XPath = "/person[$attr='$Anchor']" }
                     )
-
                     foreach ($params in $attempts) {
                         $r = Invoke-CommandIfParametersExist -CommandName $cmdName -Parameters $params
                         if ($r) { return $r }
                     }
                 }
             }
-
             return $null
         }
 
         $moduleStatus = @()
-
         try {
             Import-Module LithnetMIISAutomation -Force -ErrorAction Stop
-            $moduleStatus += [pscustomobject]@{
-                Name   = 'LithnetMIISAutomation'
-                Status = 'Loaded'
-                Error  = $null
-            }
+            $moduleStatus += [pscustomobject]@{ Name='LithnetMIISAutomation'; Status='Loaded'; Error=$null }
         }
         catch {
-            $moduleStatus += [pscustomobject]@{
-                Name   = 'LithnetMIISAutomation'
-                Status = 'LoadFailed'
-                Error  = Limit-RemoteText -Text $_.Exception.Message -MaxLength 1000
-            }
-
-            $moduleStatus | Export-Csv -Path (Join-Path $summaryDirRemote 'ObjectDiagnostics_ModuleStatus.csv') -NoTypeInformation -Encoding UTF8
+            $moduleStatus += [pscustomobject]@{ Name='LithnetMIISAutomation'; Status='LoadFailed'; Error=Limit-RemoteText -Text $_.Exception.Message -MaxLength 1000 }
+            $moduleStatus | Export-Csv -Path (Join-Path $RemoteOut 'ObjectDiagnostics_ModuleStatus.csv') -NoTypeInformation -Encoding UTF8
             return
         }
-
-        $moduleStatus | Export-Csv -Path (Join-Path $summaryDirRemote 'ObjectDiagnostics_ModuleStatus.csv') -NoTypeInformation -Encoding UTF8
+        $moduleStatus | Export-Csv -Path (Join-Path $RemoteOut 'ObjectDiagnostics_ModuleStatus.csv') -NoTypeInformation -Encoding UTF8
 
         Get-Command -Module LithnetMIISAutomation -ErrorAction SilentlyContinue |
             Select-Object Name,CommandType,ModuleName |
             Sort-Object Name |
-            Export-Csv -Path (Join-Path $summaryDirRemote 'LithnetMIISAutomation_Commands.csv') -NoTypeInformation -Encoding UTF8
+            Export-Csv -Path (Join-Path $RemoteOut 'LithnetMIISAutomation_Commands.csv') -NoTypeInformation -Encoding UTF8
 
         $anchor = $null
         if ($DN -match '^CN=([^,]+)') { $anchor = $matches[1] }
 
         $found = @()
         $mvRows = @()
-
-        foreach ($ma in Get-ManagementAgent) {
+        foreach($ma in Get-ManagementAgent){
             $safe = New-SafeRemoteFileName $ma.Name
             $csObj = $null
             $errs = @()
-
-            foreach ($attempt in 1..4) {
+            foreach($attempt in 1..4){
                 try {
-                    switch ($attempt) {
+                    switch($attempt){
                         1 { $csObj = Get-CSObject -MA $ma.Name -DN $DN -ErrorAction Stop }
                         2 { $csObj = Get-CSObject -ManagementAgent $ma.Name -DN $DN -ErrorAction Stop }
                         3 { $csObj = Get-CSObject -ManagementAgentName $ma.Name -DN $DN -ErrorAction Stop }
                         4 { $csObj = Get-CSObject -ConnectorName $ma.Name -DN $DN -ErrorAction Stop }
                     }
-
-                    if ($csObj) { break }
-                }
-                catch {
-                    $errs += (Limit-RemoteText -Text $_.Exception.Message -MaxLength 500)
-                }
+                    if($csObj){break}
+                } catch { $errs += (Limit-RemoteText -Text $_.Exception.Message -MaxLength 500) }
             }
 
-            if ($csObj) {
-                Export-AnyObject -Object $csObj -BasePath (Join-Path $csDirRemote "$safe`_CSObject")
-                Export-ObjectPropertySummary -Object $csObj -Path (Join-Path $csDirRemote "$safe`_CSObject_PropertySummary.csv")
-                Export-LithnetAttributeRows -Object $csObj -Path (Join-Path $csDirRemote "$safe`_CSObject_Attributes.csv") -DataStore 'Connector Space' -MAName $ma.Name -ObjectKind 'CSObject'
+            if($csObj){
+                Export-AnyObject -Object $csObj -BasePath (Join-Path $csDir "$safe`_CSObject")
+                Export-ObjectPropertySummary -Object $csObj -Path (Join-Path $csDir "$safe`_CSObject_PropertySummary.csv")
+                ($csObj.PSObject.Methods | Select-Object Name,MemberType,OverloadDefinitions | Sort-Object Name) |
+                    Export-Csv -Path (Join-Path $csDir "$safe`_CSObject_Methods.csv") -NoTypeInformation -Encoding UTF8
 
-                ($csObj.PSObject.Methods |
-                    Select-Object Name,MemberType,OverloadDefinitions |
-                    Sort-Object Name) |
-                    Export-Csv -Path (Join-Path $csDirRemote "$safe`_CSObject_Methods.csv") -NoTypeInformation -Encoding UTF8
-
-                $found += [pscustomobject]@{
-                    MAName   = $ma.Name
-                    Status   = 'Found'
-                    SafeName = $safe
-                }
+                $found += [pscustomobject]@{ MAName=$ma.Name; Status='Found'; SafeName=$safe }
 
                 $directMv = $null
-
-                foreach ($pname in @('MVObject','MvObject','MetaverseObject','ConnectedMVObject')) {
-                    try {
-                        if ($csObj.PSObject.Properties[$pname].Value) {
-                            $directMv = $csObj.PSObject.Properties[$pname].Value
-                            break
-                        }
-                    } catch {}
+                foreach($pname in @('MVObject','MvObject','MetaverseObject','ConnectedMVObject')){
+                    try { if($csObj.PSObject.Properties[$pname].Value){ $directMv = $csObj.PSObject.Properties[$pname].Value; break } } catch {}
                 }
-
-                if (-not $directMv) {
-                    foreach ($mname in @('GetMVObject','GetMvObject','GetMetaverseObject','GetConnectedMVObject')) {
+                if(-not $directMv){
+                    foreach($mname in @('GetMVObject','GetMvObject','GetMetaverseObject','GetConnectedMVObject')){
                         $directMv = Get-MethodResultNoArgs -Object $csObj -MethodName $mname
-                        if ($directMv) { break }
+                        if($directMv){ break }
                     }
                 }
 
-                if ($directMv) {
-                    Export-AnyObject -Object $directMv -BasePath (Join-Path $mvDirRemote "$safe`_MVObject_Direct")
-                    Export-ObjectPropertySummary -Object $directMv -Path (Join-Path $mvDirRemote "$safe`_MVObject_Direct_PropertySummary.csv")
-                    Export-LithnetAttributeRows -Object $directMv -Path (Join-Path $mvDirRemote "$safe`_MVObject_Direct_Attributes.csv") -DataStore 'Metaverse' -MAName $ma.Name -ObjectKind 'MVObject'
-
-                    $mvRows += [pscustomobject]@{
-                        MAName    = $ma.Name
-                        Method    = 'DirectFromCSObject'
-                        Candidate = $null
-                        Status    = 'Found'
-                    }
-
+                if($directMv){
+                    Export-AnyObject -Object $directMv -BasePath (Join-Path $mvDir "$safe`_MVObject_Direct")
+                    Export-ObjectPropertySummary -Object $directMv -Path (Join-Path $mvDir "$safe`_MVObject_Direct_PropertySummary.csv")
+                    $mvRows += [pscustomobject]@{ MAName=$ma.Name; Method='DirectFromCSObject'; Candidate=$null; Status='Found' }
                     continue
                 }
 
                 $candidateIds = @(Get-CandidateMvIds -Object $csObj)
-
-                $candidateIds |
-                    ForEach-Object {
-                        [pscustomobject]@{
-                            MAName        = $ma.Name
-                            CandidateMVId = $_
-                        }
-                    } |
-                    Export-Csv -Path (Join-Path $mvDirRemote "$safe`_CandidateMVIds.csv") -NoTypeInformation -Encoding UTF8
+                $candidateIds | ForEach-Object { [pscustomobject]@{ MAName=$ma.Name; CandidateMVId=$_ } } |
+                    Export-Csv -Path (Join-Path $mvDir "$safe`_CandidateMVIds.csv") -NoTypeInformation -Encoding UTF8
 
                 $resolved = $false
-
-                foreach ($candidate in $candidateIds) {
+                foreach($candidate in $candidateIds){
                     $mvObj = Try-GetMvObjectById -CandidateId $candidate
-
-                    if ($mvObj) {
-                        Export-AnyObject -Object $mvObj -BasePath (Join-Path $mvDirRemote "$safe`_MVObject_$candidate")
-                        Export-ObjectPropertySummary -Object $mvObj -Path (Join-Path $mvDirRemote "$safe`_MVObject_$candidate`_PropertySummary.csv")
-                        Export-LithnetAttributeRows -Object $mvObj -Path (Join-Path $mvDirRemote "$safe`_MVObject_$candidate`_Attributes.csv") -DataStore 'Metaverse' -MAName $ma.Name -ObjectKind 'MVObject'
-
-                        $mvRows += [pscustomobject]@{
-                            MAName    = $ma.Name
-                            Method    = 'Get-MVObjectByCandidateId'
-                            Candidate = $candidate
-                            Status    = 'Found'
-                        }
-
+                    if($mvObj){
+                        Export-AnyObject -Object $mvObj -BasePath (Join-Path $mvDir "$safe`_MVObject_$candidate")
+                        Export-ObjectPropertySummary -Object $mvObj -Path (Join-Path $mvDir "$safe`_MVObject_$candidate`_PropertySummary.csv")
+                        $mvRows += [pscustomobject]@{ MAName=$ma.Name; Method='Get-MVObjectByCandidateId'; Candidate=$candidate; Status='Found' }
                         $resolved = $true
                         break
                     }
                 }
 
-                if (-not $resolved -and $anchor) {
+                if(-not $resolved -and $anchor){
                     $mvObj = Try-SearchMvObjectByAnchor -Anchor $anchor
-
-                    if ($mvObj) {
-                        Export-AnyObject -Object $mvObj -BasePath (Join-Path $mvDirRemote "$safe`_MVObject_SearchByAnchor_$anchor")
-                        Export-ObjectPropertySummary -Object $mvObj -Path (Join-Path $mvDirRemote "$safe`_MVObject_SearchByAnchor_$anchor`_PropertySummary.csv")
-                        Export-LithnetAttributeRows -Object $mvObj -Path (Join-Path $mvDirRemote "$safe`_MVObject_SearchByAnchor_$anchor`_Attributes.csv") -DataStore 'Metaverse' -MAName $ma.Name -ObjectKind 'MVObject'
-
-                        $mvRows += [pscustomobject]@{
-                            MAName    = $ma.Name
-                            Method    = 'SearchByAnchor'
-                            Candidate = $anchor
-                            Status    = 'Found'
-                        }
-
+                    if($mvObj){
+                        Export-AnyObject -Object $mvObj -BasePath (Join-Path $mvDir "$safe`_MVObject_SearchByAnchor_$anchor")
+                        Export-ObjectPropertySummary -Object $mvObj -Path (Join-Path $mvDir "$safe`_MVObject_SearchByAnchor_$anchor`_PropertySummary.csv")
+                        $mvRows += [pscustomobject]@{ MAName=$ma.Name; Method='SearchByAnchor'; Candidate=$anchor; Status='Found' }
                         $resolved = $true
                     }
                 }
 
-                if (-not $resolved) {
-                    $mvRows += [pscustomobject]@{
-                        MAName    = $ma.Name
-                        Method    = 'BestEffort'
-                        Candidate = ($candidateIds -join ';')
-                        Status    = 'NotResolved'
-                    }
+                if(-not $resolved){
+                    $mvRows += [pscustomobject]@{ MAName=$ma.Name; Method='BestEffort'; Candidate=($candidateIds -join ';'); Status='NotResolved' }
                 }
             }
             else {
-                [pscustomobject]@{
-                    MAName = $ma.Name
-                    Status = 'NotFoundOrCommandFailed'
-                    Errors = ($errs -join ' | ')
-                } |
-                Export-Csv -Path (Join-Path $csDirRemote "$safe`_SearchErrors.csv") -NoTypeInformation -Encoding UTF8
+                [pscustomobject]@{MAName=$ma.Name; Status='NotFoundOrCommandFailed'; Errors=($errs -join ' | ')} |
+                    Export-Csv -Path (Join-Path $csDir "$safe`_SearchErrors.csv") -NoTypeInformation -Encoding UTF8
             }
         }
 
-        $found | Export-Csv -Path (Join-Path $summaryDirRemote 'ConnectorSpace_SearchSummary.csv') -NoTypeInformation -Encoding UTF8
-        $mvRows | Export-Csv -Path (Join-Path $summaryDirRemote 'Metaverse_SearchSummary.csv') -NoTypeInformation -Encoding UTF8
-        $mvRows | Export-Csv -Path (Join-Path $mvDirRemote 'Metaverse_SearchSummary.csv') -NoTypeInformation -Encoding UTF8
+        $found | Export-Csv -Path (Join-Path $RemoteOut 'ConnectorSpace_SearchSummary.csv') -NoTypeInformation -Encoding UTF8
+        $mvRows | Export-Csv -Path (Join-Path $RemoteOut 'Metaverse_SearchSummary.csv') -NoTypeInformation -Encoding UTF8
+        $mvRows | Export-Csv -Path (Join-Path $mvDir 'Metaverse_SearchSummary.csv') -NoTypeInformation -Encoding UTF8
     }
-
+    $objDiagJob = $null
     try {
-        Invoke-OnComputer -ComputerName $SyncServer -ScriptBlock $scriptBlock -ArgumentList @($remoteTemp,$GetObjADdn)
+        Write-DiagStatus "Connector Space / Metaverse object diagnostics started on $SyncServer. This may take several minutes." Cyan
 
-        Copy-RemoteFolderToLocal `
-            -ComputerName $SyncServer `
-            -RemotePath (Join-Path $remoteTemp 'ConnectorSpace') `
-            -LocalPath $csDir
+        if (Test-IsLocalComputer -ComputerName $SyncServer) {
+            $objDiagJob = Start-Job -ScriptBlock $scriptBlock -ArgumentList @($remoteTemp, $GetObjADdn)
+        }
+        else {
+            $objDiagJob = Start-Job -ScriptBlock {
+                param($ComputerName, $ScriptBlockText, $RemoteOut, $DN)
+                $sb = [scriptblock]::Create($ScriptBlockText)
+                Invoke-Command -ComputerName $ComputerName -ScriptBlock $sb -ArgumentList @($RemoteOut, $DN) -ErrorAction Stop
+            } -ArgumentList @($SyncServer, $scriptBlock.ToString(), $remoteTemp, $GetObjADdn)
+        }
 
-        Copy-RemoteFolderToLocal `
-            -ComputerName $SyncServer `
-            -RemotePath (Join-Path $remoteTemp 'Metaverse') `
-            -LocalPath $mvDir
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($objDiagJob.State -eq 'Running') {
+            Start-Sleep -Seconds 30
+            $elapsedText = $sw.Elapsed.ToString('hh\:mm\:ss')
+            Write-DiagStatus "Connector Space / Metaverse object diagnostics is still running on $SyncServer. Elapsed: $elapsedText. Please wait." DarkYellow
+        }
 
-        Copy-RemoteFolderToLocal `
-            -ComputerName $SyncServer `
-            -RemotePath (Join-Path $remoteTemp 'Summary') `
-            -LocalPath $summaryDir
+        Receive-Job -Job $objDiagJob -ErrorAction Stop | Out-Null
+        Write-DiagStatus "Connector Space / Metaverse object diagnostics completed on $SyncServer. Copying files." Cyan
+
+        Copy-RemoteFolderToLocal -ComputerName $SyncServer -RemotePath (Join-Path $remoteTemp 'ConnectorSpace') -LocalPath $csDir
+        Copy-RemoteFolderToLocal -ComputerName $SyncServer -RemotePath (Join-Path $remoteTemp 'Metaverse') -LocalPath $mvDir
+        Copy-RemoteFolderToLocal -ComputerName $SyncServer -RemotePath $remoteTemp -LocalPath (Join-Path $OutDir 'OBJECT_SUMMARY')
     }
-    catch {
-        Write-DiagError -Stage 'Export-ObjectDiagnostics' -Target "CS/MV $GetObjADdn" -ErrorRecord $_
-    }
+    catch { Write-DiagError -Stage 'Export-ObjectDiagnostics' -Target "CS/MV $GetObjADdn" -ErrorRecord $_ }
     finally {
+        if ($null -ne $objDiagJob) { Remove-Job -Job $objDiagJob -Force -ErrorAction SilentlyContinue }
         Remove-RemoteTempFolder -ComputerName $SyncServer -RemotePath $remoteTemp -Stage 'Export-ObjectDiagnostics-CleanupRemoteTemp'
     }
 }
@@ -2812,193 +2237,9 @@ function Convert-TextFileToHtmlSection {
     }
 }
 
-
-function Convert-ObjectCsvToAttributeValueHtmlSection {
-    param(
-        [string]$Title,
-        [string]$Path,
-        [int]$MaxValueLength = 4000
-    )
-
-    $titleEncoded = [System.Net.WebUtility]::HtmlEncode($Title)
-    $pathEncoded = [System.Net.WebUtility]::HtmlEncode($Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return "<section><h2>$titleEncoded</h2><p class='missing'>Not found: $pathEncoded</p></section>"
-    }
-
-    try {
-        $objects = @(Import-Csv -LiteralPath $Path)
-        if ($objects.Count -eq 0) {
-            return "<section><h2>$titleEncoded</h2><p>File exists but contains no rows.</p><p class='path'>$pathEncoded</p></section>"
-        }
-
-        $rows = @()
-        $objectIndex = 0
-        foreach ($object in $objects) {
-            $objectIndex++
-            foreach ($prop in $object.PSObject.Properties) {
-                $valueText = [string]$prop.Value
-                if ($null -ne $valueText -and $valueText.Length -gt $MaxValueLength) {
-                    $valueText = $valueText.Substring(0, $MaxValueLength) + ' ... [truncated]'
-                }
-
-                $rows += [pscustomobject]@{
-                    ObjectNo      = $objectIndex
-                    AttributeName = $prop.Name
-                    Value         = $valueText
-                }
-            }
-        }
-
-        $fragment = $rows | ConvertTo-Html -Fragment
-        return "<section><h2>$titleEncoded</h2><p class='path'>$pathEncoded</p><p class='note'>Attributes: $($rows.Count)</p>$fragment</section>"
-    }
-    catch {
-        $err = [System.Net.WebUtility]::HtmlEncode((Limit-Text -Text $_.Exception.Message -MaxLength 500))
-        return "<section><h2>$titleEncoded</h2><p class='error'>Failed to render object attributes: $err</p><p class='path'>$pathEncoded</p></section>"
-    }
-}
-
-function New-MimObjectDiagnosticHtmlReport {
-    param([string]$ReportPath)
-
-    Write-DiagStatus 'Creating OBJ mode HTML summary report' Cyan
-
-    $objectRoot = $SyncDataDir
-    $adDir      = Join-Path $objectRoot 'OBJECT_ADDS'
-    $csDir      = Join-Path $objectRoot 'OBJECT_CONNECTOR_SPACE'
-    $mvDir      = Join-Path $objectRoot 'OBJECT_METAVERSE'
-    $summaryDir = Join-Path $objectRoot 'OBJECT_SUMMARY'
-
-    $sections = @()
-    $sections += Convert-CsvFileToHtmlSection -Title 'Run Summary' -Path (Join-Path $Root 'RunSummary.csv') -MaxRows 50
-
-    $adAttributeCsv = Join-Path $adDir 'ADDS_Object_Attributes.csv'
-    $adPropertySummary = Join-Path $adDir 'ADDS_Object_PropertySummary.csv'
-    if (Test-Path -LiteralPath $adAttributeCsv) {
-        $sections += Convert-CsvFileToHtmlSection -Title 'AD DS User Attributes' -Path $adAttributeCsv -MaxRows 3000
-    }
-    elseif (Test-Path -LiteralPath $adPropertySummary) {
-        $sections += Convert-CsvFileToHtmlSection -Title 'AD DS User Attributes' -Path $adPropertySummary -MaxRows 3000
-    }
-    else {
-        $sections += Convert-ObjectCsvToAttributeValueHtmlSection -Title 'AD DS User Attributes' -Path (Join-Path $adDir 'ADDS_Object.csv')
-    }
-
-    $sections += Convert-CsvFileToHtmlSection -Title 'Connector Space Search Summary' -Path (Join-Path $summaryDir 'ConnectorSpace_SearchSummary.csv') -MaxRows 200
-
-    $csAttributeFiles = @()
-    if (Test-Path -LiteralPath $csDir) {
-        $csAttributeFiles = @(Get-ChildItem -LiteralPath $csDir -Filter '*_CSObject_Attributes.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)
-    }
-
-    if ($csAttributeFiles.Count -gt 0) {
-        foreach ($file in $csAttributeFiles) {
-            $title = 'Connector Space User Attributes - ' + $file.BaseName
-            $sections += Convert-CsvFileToHtmlSection -Title $title -Path $file.FullName -MaxRows 3000
-        }
-    }
-    else {
-        $csPropertyFiles = @()
-        if (Test-Path -LiteralPath $csDir) {
-            $csPropertyFiles = @(Get-ChildItem -LiteralPath $csDir -Filter '*_CSObject_PropertySummary.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)
-        }
-        if ($csPropertyFiles.Count -gt 0) {
-            foreach ($file in $csPropertyFiles) {
-                $title = 'Connector Space Object Properties - ' + $file.BaseName
-                $sections += Convert-CsvFileToHtmlSection -Title $title -Path $file.FullName -MaxRows 3000
-            }
-        }
-        else {
-            $sections += "<section><h2>Connector Space User Attributes</h2><p class='missing'>No *_CSObject_Attributes.csv files were found.</p></section>"
-        }
-    }
-
-    $sections += Convert-CsvFileToHtmlSection -Title 'Metaverse Search Summary' -Path (Join-Path $summaryDir 'Metaverse_SearchSummary.csv') -MaxRows 200
-
-    $mvAttributeFiles = @()
-    if (Test-Path -LiteralPath $mvDir) {
-        $mvAttributeFiles = @(Get-ChildItem -LiteralPath $mvDir -Filter '*_MVObject*_Attributes.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)
-    }
-
-    if ($mvAttributeFiles.Count -gt 0) {
-        foreach ($file in $mvAttributeFiles) {
-            $title = 'Metaverse User Attributes - ' + $file.BaseName
-            $sections += Convert-CsvFileToHtmlSection -Title $title -Path $file.FullName -MaxRows 3000
-        }
-    }
-    else {
-        $mvPropertyFiles = @()
-        if (Test-Path -LiteralPath $mvDir) {
-            $mvPropertyFiles = @(Get-ChildItem -LiteralPath $mvDir -Filter '*_MVObject*_PropertySummary.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)
-        }
-        if ($mvPropertyFiles.Count -gt 0) {
-            foreach ($file in $mvPropertyFiles) {
-                $title = 'Metaverse Object Properties - ' + $file.BaseName
-                $sections += Convert-CsvFileToHtmlSection -Title $title -Path $file.FullName -MaxRows 3000
-            }
-        }
-        else {
-            $sections += "<section><h2>Metaverse User Attributes</h2><p class='missing'>No *_MVObject*_Attributes.csv files were found.</p></section>"
-        }
-    }
-
-    $generated = [System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
-    $rootEncoded = [System.Net.WebUtility]::HtmlEncode($Root)
-    $dnEncoded = [System.Net.WebUtility]::HtmlEncode($GetObjADdn)
-
-    $style = @'
-<style>
-body { font-family: Segoe UI, Meiryo, Arial, sans-serif; margin: 24px; color: #242424; }
-h1 { border-bottom: 3px solid #555; padding-bottom: 8px; }
-h2 { margin-top: 28px; border-left: 6px solid #777; padding-left: 10px; }
-table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
-th, td { border: 1px solid #ccc; padding: 4px 6px; vertical-align: top; overflow-wrap: anywhere; }
-th { background: #f2f2f2; position: sticky; top: 0; }
-pre { background: #f7f7f7; border: 1px solid #ddd; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.path { color: #666; font-size: 12px; }
-.note { color: #555; }
-.missing { color: #a66; }
-.error { color: #b00020; font-weight: 600; }
-section { margin-bottom: 24px; }
-</style>
-'@
-
-    $html = @(
-        '<!DOCTYPE html>',
-        '<html>',
-        '<head>',
-        '<meta charset="utf-8" />',
-        '<title>MIM Object Diagnostic Summary</title>',
-        $style,
-        '</head>',
-        '<body>',
-        '<h1>MIM Object Diagnostic Summary</h1>',
-        "<p><strong>Generated:</strong> $generated</p>",
-        "<p><strong>Output root:</strong> $rootEncoded</p>",
-        "<p><strong>Target DN:</strong> $dnEncoded</p>",
-        '<p class="note">This report summarizes attribute names and values collected from AD DS, Connector Space, and Metaverse for the target object.</p>',
-        ($sections -join "`r`n"),
-        '</body>',
-        '</html>'
-    )
-
-    $html -join "`r`n" | Out-File -FilePath $ReportPath -Encoding UTF8
-
-    try {
-        if (Test-Path -LiteralPath $SyncDataDir) {
-            Copy-Item -LiteralPath $ReportPath -Destination (Join-Path $SyncDataDir 'MIM_Diagnostic_Report.html') -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
-}
-
 function New-MimDiagnosticHtmlReport {
     param([string]$ReportPath)
-    if ($ObjectMode) {
-        New-MimObjectDiagnosticHtmlReport -ReportPath $ReportPath
-        return
-    }
+    if ($ObjectMode) { return }
     Write-DiagStatus 'Creating HTML summary report' Cyan
 
     $sections = @()
@@ -3061,31 +2302,37 @@ section { margin-bottom: 24px; }
         '</html>'
     )
     $html -join "`r`n" | Out-File -FilePath $ReportPath -Encoding UTF8
-    try {
-        if (Test-Path -LiteralPath $ConfigDir) {
-            Copy-Item -LiteralPath $ReportPath -Destination (Join-Path $ConfigDir 'MIM_Diagnostic_Report.html') -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
 }
 
 try {
     Write-DiagStatus 'Get-MIMDiagData.ps1 started' Green
     Write-DiagStatus "Output root: $Root" Green
-    Write-DiagStatus "Mode: $(if($ObjectMode){'OBJ'}else{'ALL'})" Green
+    $modeText = if ($ObjectMode) { 'OBJ' } elseif ($FIMServiceOnly) { 'FIMServiceOnly' } elseif ($FIMSyncOnly) { 'FIMSyncOnly' } else { 'ALL' }
+    Write-DiagStatus "Mode: $modeText" Green
     Write-DiagStatus "SyncServer: $SyncServer" Green
-    Write-DiagStatus "MimServiceUri: $MimServiceUri" Green
+    if ([string]::IsNullOrWhiteSpace($MimServiceUri)) { Write-DiagStatus "MimServiceUri: <not specified / skipped>" Green } else { Write-DiagStatus "MimServiceUri: $MimServiceUri" Green }
     if ($SkipPCNS -or [string]::IsNullOrWhiteSpace($PcnSServer)) { Write-DiagStatus "PcnSServer: <not specified / skipped>" Green } else { Write-DiagStatus "PcnSServer: $PcnSServer" Green }
     if ($ObjectMode) {
         Export-ObjectDiagnostics -OutDir $SyncDataDir
-        Export-EventLogs -OutDir $EventLogDir
     }
     else {
-        Export-SyncDataAll -OutDir $SyncDataDir
-        Export-ManagementAgentConfigs -OutDir $ConfigDir
-        Export-MetaverseExtensionConfig -OutDir $ConfigDir
-        try { Export-MimServiceConfig -OutDir $ConfigDir } catch { Write-DiagError -Stage 'Export-MimServiceConfig' -Target $MimServiceUri -ErrorRecord $_ }
-        Export-MimInstallationConfigFiles -OutDir $ConfigDir
-        Export-PCNSConfig -OutDir $ConfigDir
+        if (-not $FIMServiceOnly) {
+            Export-SyncDataAll -OutDir $SyncDataDir
+            Export-ManagementAgentConfigs -OutDir $ConfigDir
+            Export-MetaverseExtensionConfig -OutDir $ConfigDir
+        }
+        else {
+            Write-DiagStatus 'Skipping FIMSynchronizationService-side collection because -FIMServiceOnly was specified.' DarkYellow
+        }
+
+        if (-not $FIMSyncOnly) {
+            try { Export-MimServiceConfig -OutDir $ConfigDir } catch { Write-DiagError -Stage 'Export-MimServiceConfig' -Target $MimServiceUri -ErrorRecord $_ }
+            Export-PCNSConfig -OutDir $ConfigDir
+        }
+        else {
+            Write-DiagStatus 'Skipping FIMService-side and PCNS collection because -FIMSyncOnly was specified.' DarkYellow
+        }
+
         Export-EventLogs -OutDir $EventLogDir
         Export-SystemDiagnostics -OutDir $DiagDir
         Export-NetworkDiagnostics -OutDir $DiagDir
@@ -3096,27 +2343,20 @@ try {
             Remove-Item -LiteralPath $localWorkRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     } catch {}
-    [pscustomobject]@{StartTime=$ScriptStartTime;EndTime=Get-Date;Mode=if($ObjectMode){'OBJ'}else{'ALL'};OutputRoot=$Root;SyncServer=$SyncServer;MimServiceUri=$MimServiceUri;PcnSServer=$PcnSServer;SkipPCNS=$SkipPCNS.IsPresent;ErrorLog=$Global:DiagErrorCsv} | Export-Csv -Path (Join-Path $Root 'RunSummary.csv') -NoTypeInformation -Encoding UTF8
-    try { New-MimDiagnosticHtmlReport -ReportPath (Join-Path $Root 'MIM_Diagnostic_Report.html') } catch { Write-DiagError -Stage 'New-MimDiagnosticHtmlReport' -Target $Root -ErrorRecord $_ }
+    [pscustomobject]@{StartTime=$ScriptStartTime;EndTime=Get-Date;Mode=$modeText;OutputRoot=$Root;SyncServer=$SyncServer;MimServiceUri=$MimServiceUri;PcnSServer=$PcnSServer;SkipPCNS=$SkipPCNS.IsPresent;ErrorLog=$Global:DiagErrorCsv} | Export-Csv -Path (Join-Path $Root 'RunSummary.csv') -NoTypeInformation -Encoding UTF8
+    if (-not $ObjectMode) {
+        try { New-MimDiagnosticHtmlReport -ReportPath (Join-Path $Root 'MIM_Diagnostic_Report.html') } catch { Write-DiagError -Stage 'New-MimDiagnosticHtmlReport' -Target $Root -ErrorRecord $_ }
+    }
     Write-DiagStatus 'Get-MIMDiagData.ps1 completed' Green
     try { Stop-Transcript | Out-Null; $script:TranscriptStopped = $true } catch {}
-    if (-not $NoZip) {
-        try {
-            $zip = "$Root.zip"
-            if (Test-Path $zip) { Remove-Item $zip -Force }
-            Write-DiagStatus "Creating ZIP output: $zip" Green
-            Write-DiagStatus 'The uncompressed output root folder will be removed after ZIP creation.' Green
-            Compress-Archive -Path (Join-Path $Root '*') -DestinationPath $zip -Force -ErrorAction Stop
-            try {
-                Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
-            }
-            catch {
-                Write-Host ("[{0}] WARN failed to remove output root folder after ZIP creation: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message) -ForegroundColor DarkYellow
-            }
-            Write-Host ("[{0}] ZIP output: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $zip) -ForegroundColor Green
-        }
-        catch { Write-DiagError -Stage 'Compress-Archive' -Target $Root -ErrorRecord $_ }
+    try {
+        $zip = "$Root.zip"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+        Compress-Archive -Path $Root -DestinationPath $zip -Force -ErrorAction Stop
+        Write-DiagStatus "ZIP output: $zip" Green
+        Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
     }
+    catch { Write-DiagError -Stage 'Compress-Archive' -Target $Root -ErrorRecord $_ }
 }
 catch { Write-DiagError -Stage 'Main' -Target 'Script' -ErrorRecord $_; Write-DiagStatus 'Get-MIMDiagData.ps1 stopped after recording an error. See Get-MIMDiagData_Errors.csv.' DarkYellow }
 finally { if (-not $script:TranscriptStopped) { try { Stop-Transcript | Out-Null } catch {} } }
