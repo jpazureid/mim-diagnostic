@@ -91,9 +91,9 @@ Get-Command Get-ADDomainController -ErrorAction SilentlyContinue
 FIMSynchronizationService サーバー上で以下を実行し、`LithnetMIISAutomation` が利用できることを確認します。
 
 ```powershell
-Install-Module -Name LithnetMIISAutomation -Scope CurrentUser -Force
-Import-Module LithnetMIISAutomation -Force -ErrorAction SilentlyContinue
-Get-Command -Module LithnetMIISAutomation -ErrorAction SilentlyContinue
+Install-Module -Name LithnetMIISAutomation -Scope CurrentUser
+Import-Module LithnetMIISAutomation
+Get-Command -Module LithnetMIISAutomation
 ```
 
 ---
