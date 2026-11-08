@@ -91,7 +91,7 @@ Get-Command Get-ADDomainController -ErrorAction SilentlyContinue
 FIMSynchronizationService サーバー上で以下を実行し、`LithnetMIISAutomation` が利用できることを確認します。
 
 ```powershell
-Install-Module -Name LithnetMIISAutomation -Scope AllUsers -Force
+Install-Module -Name LithnetMIISAutomation -Scope CurrentUser -Force
 Import-Module LithnetMIISAutomation -Force -ErrorAction SilentlyContinue
 Get-Command -Module LithnetMIISAutomation -ErrorAction SilentlyContinue
 ```
@@ -323,7 +323,7 @@ Get-ADGroup <GroupName> | Select-Object DistinguishedName
 
 ## 事後作業
 
-診断ログの取得が完了したら、必要に応じて以下を実施します。
+診断ログの取得が完了したら、以下を実施します。
 
 ### 実行ポリシーを元に戻す
 
@@ -345,7 +345,7 @@ Get-ExecutionPolicy -List
 診断完了後、環境に不要なモジュールを残したくない場合は、追加で導入したモジュールのみ削除します。
 MIM / SharePoint の製品コンポーネントとして導入されているスナップインは、個別削除ではなく製品側の変更操作で管理してください。
 
-#### LithnetMIISAutomation を削除する場合
+#### LithnetMIISAutomation を削除
 
 PowerShell Gallery から `Install-Module` で導入した場合は、以下で削除します。
 
